@@ -33,7 +33,7 @@ let rec is_empty_stack = function
   [] -> true
   | Zupdate _::s -> is_empty_stack s
   | Zshift _::s -> is_empty_stack s
-  | Zuniv _::s -> assert false (* is_empty_stack s *)
+  | Zuniv _::s -> is_empty_stack s
   | _ -> false
 
 (* Compute the lift and universe substitution to be performed on a term placed in a given stack *)
@@ -43,8 +43,8 @@ let el_stack (el,u) stk =
       (fun (i,subst) z ->
         match z with
             Zshift n -> (i+n, subst)
-          | Zuniv u -> assert false (* (i, if Univ.Instance.is_empty subst then u else
-                           Univ.subst_instance_instance u subst) *)
+          | Zuniv u -> (i, if Univ.Instance.is_empty subst then u else
+                              Univ.subst_instance_instance u subst)
           | _ -> (i,subst))
       (0, Univ.Instance.empty)
       stk in
@@ -101,10 +101,9 @@ let pure_stack lfts stk =
               (Zupdate _,lpstk)  -> lpstk
             | (Zshift n,(l,pstk)) -> (mapfst (el_shft n) l, pstk)
             | (Zuniv u',((l,u),pstk)) ->
-              (* let u = if Univ.Instance.is_empty u then u' else
+              let u = if Univ.Instance.is_empty u then u' else
                          Univ.subst_instance_instance u u' in
-              ((l,u), pstk) *)
-              assert false
+              ((l,u), pstk)
             | (Zapp a, (l,pstk)) ->
                 (l,zlapp (map_lift l a) pstk)
             | (Zproj p, (l,pstk)) ->

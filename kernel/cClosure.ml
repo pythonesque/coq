@@ -426,8 +426,8 @@ let zshift n s =
       (0,_) -> s
     | (_,Zshift(k)::s) -> Zshift(n+k)::s
     (* commutes with Zuniv *)
-    | (_,Zuniv(u)::Zshift(k)::s) -> assert false (* Zuniv(u)::Zshift(n+k)::s *)
-    | (_,Zuniv(u)::s) -> assert false (* Zuniv(u)::Zshift(n)::s *)
+    | (_,Zuniv(u)::Zshift(k)::s) -> Zuniv(u)::Zshift(n+k)::s
+    | (_,Zuniv(u)::s) -> Zuniv(u)::Zshift(n)::s
     | _ -> Zshift(n)::s
 
 (* Collapse universe substitutions in the stack.
@@ -435,17 +435,17 @@ let zshift n s =
 let zuniv u s =
   if Univ.Instance.is_empty u then s else
   match s with
-  | Zuniv(u')::s -> assert false
-          (* let u'' = Univ.subst_instance_instance u' u in
+  | Zuniv(u')::s' ->
+          let u'' = Univ.subst_instance_instance u' u in
           if u'' == u' then s else
-          Zuniv u''::s *)
-  | _ -> assert false (* Zuniv(u)::s *)
+          Zuniv u''::s'
+  | _ -> Zuniv(u)::s
 
 let rec stack_args_size = function
   | Zapp v :: s -> Array.length v + stack_args_size s
   | Zshift(_)::s -> stack_args_size s
   | Zupdate(_)::s -> stack_args_size s
-  | Zuniv(_)::s -> assert false (* stack_args_size s *)
+  | Zuniv(_)::s -> stack_args_size s
   | _ -> 0
 
 (* When used as an argument stack (only Zapp can appear) *)
@@ -556,10 +556,10 @@ let rec unv_fconstr u ft =
        are FFlex(ConstKey) which is shared via the infos table). *)
     (* commutes with lifts. *)
     | FLIFT(k,m) -> lft_fconstr k (unv_fconstr u m)
-    | FUNIV(u',m) -> assert false (* unv_fconstr (Univ.subst_instance_instance u u') m *)
+    | FUNIV(u',m) -> unv_fconstr (Univ.subst_instance_instance u u') m
     | FLOCKED -> assert false
     | (*FFlex _ | *) FApp _ | FProj _ | FCaseT _ | FProd _ | FLetIn _
-      | FEvar _ | FCLOS _ -> assert false (* {norm=ft.norm; term=FUNIV(u,ft)} *)
+      | FEvar _ | FCLOS _ -> {norm=ft.norm; term=FUNIV(u,ft)}
 let univ_fconstr u f =
   if Univ.Instance.is_empty u then f else unv_fconstr u f
 
@@ -581,8 +581,8 @@ let clos_rel e i =
 let compact_stack head stk =
   let rec strip_rec depth u = function
     | Zshift(k)::s -> strip_rec (depth+k) u s
-    | Zuniv(u')::s -> (*strip_rec depth (if Univ.Instance.is_empty u then u' else
-                                       Univ.subst_instance_instance u' u) s*)assert false
+    | Zuniv(u')::s -> strip_rec depth (if Univ.Instance.is_empty u then u' else
+                                       Univ.subst_instance_instance u' u) s
     | Zupdate(m)::s ->
         (* Be sure to create a new cell otherwise sharing would be
            lost by the update operation *)
@@ -653,14 +653,14 @@ let rec exliftn_subst subst c = match Constr.kind c with
     subst_instance_constr (snd subst) c
   | _ -> Constr.map_with_binders (mapfst el_lift) exliftn_subst subst c
 
-let liftn_subst subst n k c =
+(* let liftn_subst subst n k c =
   match el_liftn (pred k) (el_shft n el_id) with
     | ELID -> if Univ.Instance.is_empty subst then c else
                  subst_instance_constr subst c
     | el -> if Univ.Instance.is_empty subst then exliftn el c else
                exliftn_subst (el,subst) c
 
-let lift_subst subst n = liftn_subst subst n 1
+let lift_subst subst n = liftn_subst subst n 1 *)
 
 (* (* Compose two instances that are both substitutions.
    NOTE: correctness depends on first substitution being immediately before
@@ -758,11 +758,11 @@ let rec to_constr lfts v =
       let subs = comp_subs lfts e in
         mkEvar(ev,Array.map (fun a -> subst_constr subs a) args)
     | FLIFT (k,a) -> to_constr (mapfst (el_shft k) lfts) a
-    | FUNIV (u,a) -> assert false (*
+    | FUNIV (u,a) ->
       let subst = snd lfts in
       let subst' = if Univ.Instance.is_empty subst then u else
                    Univ.subst_instance_instance subst u in
-      to_constr (fst lfts, subst') a *)
+      to_constr (fst lfts, subst') a
     | FCLOS (t,((env, subst) as e)) ->
       if is_subs_id env && Univ.Instance.is_empty subst &&
          is_lift_id (fst lfts) && Univ.Instance.is_empty (snd lfts) then
@@ -819,7 +819,7 @@ let rec zip m stk =
     | Zshift(n)::s ->
         zip (lift_fconstr n m) s
     | Zuniv(u)::s ->
-        (* zip (univ_fconstr u m) s *) assert false
+        zip (univ_fconstr u m) s
     | Zupdate(rf)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
         zip (update ~share:true rf m.norm m.term) s
@@ -843,11 +843,11 @@ let strip_update_shift_app_red head stk =
     | Zshift(k) as e :: s ->
         strip_rec (e::rstk) (lift_fconstr k h) (depth+k) subst s
     | Zuniv(u) as e :: s ->
-        (* strip_rec (e::rstk) (univ_fconstr u h) depth
+        strip_rec (e::rstk) (unv_fconstr u h) depth
                   (u::subst) s
                   (* (match subst with
                    | [] -> [u]
-                   | u'::substs -> Univ.subst_instance_instance u u'::subst) *) *) assert false
+                   | u'::substs -> Univ.subst_instance_instance u u'::subst) *)
     | (Zapp args :: s) ->
         strip_rec (Zapp args :: rstk)
           {norm=h.norm;term=FApp(h,args)} depth subst s
@@ -872,7 +872,7 @@ let get_nth_arg head n stk =
     | Zshift(k) as e :: s ->
         strip_rec (e::rstk) (lift_fconstr k h) n s
     | Zuniv(u) as e :: s ->
-        (* strip_rec (e::rstk) (univ_fconstr u h) n s *) assert false
+        strip_rec (e::rstk) (unv_fconstr u h) n s
     | Zapp args::s' ->
         let q = Array.length args in
         if n >= q
@@ -901,7 +901,7 @@ let get_args_univ n stk =
   let rec strip_rec subst n = function
     | Zupdate _ :: s -> strip_rec subst n s
     | Zshift _ :: s -> strip_rec subst n s
-    | Zuniv u :: s -> (* strip_rec (u::subst) n s *) assert false
+    | Zuniv u :: s -> strip_rec (u::subst) n s
     | Zapp l :: s ->
         let na = Array.length l in
         if n <= na then subst
@@ -928,10 +928,9 @@ let rec get_args n tys f e subst stk =
     | Zuniv u :: s ->
         (* We know (tl subst) must be nonempty here since we ran
          * get_args_univ n stk to get subst initially *)
-        (* get_args n tys f (fst e, if Univ.Instance.is_empty (snd e) then u else
+        get_args n tys f (fst e, if Univ.Instance.is_empty (snd e) then u else
                                     Univ.subst_instance_instance u (snd e))
-                 (List.tl subst) s *)
-        assert false
+                 (List.tl subst) s
     | Zapp l :: s ->
         let na = Array.length l in
         (* We know subst must be [] if n <= na *)
@@ -964,8 +963,6 @@ let rec reloc_rargs_rec depth subst stk =
         let args' = univ_lift_fconstr_vect depth subst args in
         Zapp args' :: reloc_rargs_rec depth subst s
     | Zuniv(_)::s ->
-        assert false
-        (*
         (* tl must exist, since subst was built up by strip_update_shift_app *)
         (match List.tl subst with
          | [] when Int.equal depth 0 -> s
@@ -996,7 +993,7 @@ let rec reloc_rargs_rec depth subst stk =
                On the other hand, if we remember each universe substitution as we
                walk up the stack, we can do better, by simply shedding one every
                time we see a Zuniv.
-           *) *)
+           *)
     | Zshift(k)::s -> if Int.equal k depth && subst = [] then s else
                          reloc_rargs_rec (depth-k) subst s
     | _ -> stk
@@ -1016,7 +1013,7 @@ let rec try_drop_parameters depth subst n argstk =
           reloc_rargs depth subst (append_stack aft s)
     | Zshift(k)::s -> try_drop_parameters (depth-k) subst n s
     (* tl must exist, since subst was built up by strip_update_shift_app *)
-    | Zuniv _::s -> assert false (* try_drop_parameters depth (List.tl subst) n s *)
+    | Zuniv _::s -> try_drop_parameters depth (List.tl subst) n s
     | [] ->
 	if Int.equal n 0 then []
 	else raise Not_found
@@ -1108,7 +1105,7 @@ let unfold_projection info p =
 let rec knh info m stk =
   match m.term with
     | FLIFT(k,a) -> knh info a (zshift k stk)
-    | FUNIV(u,a) -> assert false (* knh info a (zuniv u stk) *)
+    | FUNIV(u,a) -> knh info a (zuniv u stk)
     | FCLOS(t,e) -> knht info e t (zupdate info m stk)
     | FLOCKED -> assert false
     | FApp(a,b) -> knh info a (append_stack b (zupdate info m stk))
@@ -1138,8 +1135,7 @@ and knht info e t stk =
     | Cast(a,_,_) -> knht info e a stk
     | Rel n -> knh info (clos_rel (fst e) n) stk
     | Proj (p, c) -> knh info { norm = Red; term = FProj (p, mk_clos e c) } stk
-    | Const _ -> knh info (mk_clos e t) stk
-    | (Ind _|Construct _|Var _|Meta _ | Sort _) -> (mk_clos e t, stk)
+    | (Const _|Ind _|Construct _|Var _|Meta _ | Sort _) -> (mk_clos e t, stk)
     | CoFix cfx -> { norm = Cstr; term = FCoFix (cfx,e) }, stk
     | Lambda _ -> { norm = Cstr; term = mk_lambda e t }, stk
     | Prod (n, t, c) ->
@@ -1158,9 +1154,9 @@ let rec knr info tab m stk =
       (match get_args n tys f e (get_args_univ n stk) stk with
           Inl e', s -> knit info tab e' f s
         | Inr lam, s -> (lam,s))
-  | FFlex(ConstKey (kn,_ as c)) when red_set info.i_flags (fCONST kn) ->
-      (match ref_value_cache info tab (ConstKey c) with
-          Some v -> kni info tab v stk
+  | FFlex(ConstKey (kn,u)) when red_set info.i_flags (fCONST kn) ->
+      (match ref_value_cache info tab (ConstKey (kn,Univ.Instance.empty)) with
+          Some v -> kni info tab (univ_fconstr u v) stk
         | None -> (set_norm m; (m,stk)))
   | FFlex(VarKey id) when red_set info.i_flags (fVAR id) ->
       (match ref_value_cache info tab (VarKey id) with
@@ -1206,7 +1202,7 @@ let rec knr info tab m stk =
   | FLOCKED | FRel _ | FAtom _ | FFlex _ | FInd _ | FApp _ | FProj _
     | FFix _ | FCoFix _ | FCaseT _ | FLambda _ | FProd _ | FLetIn _ | FLIFT _
     | FCLOS _ -> (m, stk)
-    | FUNIV _ -> assert false (* (m, stk) *)
+    | FUNIV _ -> (m, stk)
 
 
 (* Computes the weak head normal form of a term *)
@@ -1239,7 +1235,7 @@ let rec zip_term zfun m stk =
     | Zshift(n)::s ->
         zip_term zfun (lift n m) s
     | Zuniv(u)::s ->
-        (* zip_term zfun (subst_instance_constr u m) s *) assert false
+        zip_term zfun (subst_instance_constr u m) s
     | Zupdate(_rf)::s ->
         zip_term zfun m s
 
@@ -1288,7 +1284,7 @@ and norm_head info tab m =
           mkProj (p, kl info tab c)
       | FLOCKED | FRel _ | FAtom _ | FFlex _ | FInd _ | FConstruct _
         | FApp _ | FCaseT _ | FLIFT _ | FCLOS _ -> term_of_fconstr m
-        | FUNIV _ -> assert false (* term_of_fconstr m *)
+        | FUNIV _ -> term_of_fconstr m
 
 (* Initialization and then normalization *)
 
@@ -1330,9 +1326,10 @@ let infos_with_reds infos reds =
 
 let unfold_reference info tab key =
   match key with
-  | ConstKey (kn,_) ->
+  | ConstKey (kn,u) ->
     if red_set info.i_flags (fCONST kn) then
-      ref_value_cache info tab key
+      Option.map (univ_fconstr u)
+                 (ref_value_cache info tab (ConstKey (kn,Univ.Instance.empty)))
     else None
   | VarKey i ->
     if red_set info.i_flags (fVAR i) then

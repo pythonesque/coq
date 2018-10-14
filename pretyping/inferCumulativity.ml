@@ -33,7 +33,7 @@ let infer_level_eq u variances =
 let get_univ subst stk =
   let open CClosure in
   let rec strip_rec subst = function
-    | Zuniv u :: s -> assert false (* strip_rec (u::subst) s *)
+    | Zuniv u :: s -> strip_rec (u::subst) s
     | _ :: s -> strip_rec subst s
     | [] -> subst in
   let subst' = strip_rec [] stk in
@@ -241,7 +241,7 @@ and infer_stack infos variances subst (stk:CClosure.stack) =
         (infer_vect infos variances subst (Array.map (mk_clos e) br), subst)
       | Zshift _ -> (variances, subst)
       (* tl subst must exist because subst is derived from get_univ stk *)
-      | Zuniv u -> assert false (* (variances, List.tl subst) *)
+      | Zuniv u -> (variances, List.tl subst)
       | Zupdate _ -> (variances, subst)
     in
     infer_stack infos variances subst stk
