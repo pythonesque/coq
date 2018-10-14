@@ -261,7 +261,7 @@ let eq_table_key = IdKeyHash.equal
 type 'a infos_tab = 'a KeyTable.t
 
 type 'a infos_cache = {
-  i_repr : 'a infos -> 'a infos_tab -> constr -> 'a;
+  i_repr : 'a infos -> 'a infos_tab -> constr Univ.puniverses -> 'a;
   i_env : env;
   i_sigma : existential -> constr option;
   i_rels : (Constr.rel_declaration * lazy_val) Range.t;
@@ -286,8 +286,9 @@ let ref_value_cache ({i_cache = cache;_} as infos) tab ref =
     Some (KeyTable.find tab ref)
   with Not_found ->
   try
-    let body =
+    let (body, ref, u) =
       match ref with
+    (* RelKey and VarKey are not universe polymorphic *)
 	| RelKey n ->
           let open! Context.Rel.Declaration in
           let i = n - 1 in
@@ -297,12 +298,15 @@ let ref_value_cache ({i_cache = cache;_} as infos) tab ref =
           in
           begin match d with
           | LocalAssum _ -> raise Not_found
-          | LocalDef (_, t, _) -> lift n t
+          | LocalDef (_, t, _) -> (lift n t,ref,Univ.Instance.empty)
           end
-	| VarKey id -> assoc_defined id cache.i_env
-	| ConstKey cst -> constant_value_in cache.i_env cst
+    | VarKey id -> (assoc_defined id cache.i_env,ref,Univ.Instance.empty)
+    | ConstKey (kn,u) ->
+      let cst = (kn,Univ.Instance.empty) in
+      (* FIXME: See if we can turn this into ConstKey cst *)
+      (constant_value_in cache.i_env cst,(* ConstKey cst *)ref,u)
     in
-    let v = cache.i_repr infos tab body in
+    let v = cache.i_repr infos tab (body, u) in
     KeyTable.add tab ref v;
     Some v
   with
@@ -352,6 +356,9 @@ let neutr = function
   | (Whnf|Norm) -> Whnf
   | (Red|Cstr) -> Red
 
+let mapfst f (e,u) = (f e, u)
+let mapfstsnd f x (e,u) = (f (x,e), u)
+
 type fconstr = {
   mutable norm: red_state;
   mutable term: fterm }
@@ -364,15 +371,16 @@ and fterm =
   | FConstruct of pconstructor
   | FApp of fconstr * fconstr array
   | FProj of Projection.t * fconstr
-  | FFix of fixpoint * fconstr subs
-  | FCoFix of cofixpoint * fconstr subs
-  | FCaseT of case_info * constr * fconstr * constr array * fconstr subs (* predicate and branches are closures *)
-  | FLambda of int * (Name.t * constr) list * constr * fconstr subs
+  | FFix of fixpoint * fconstr subs Univ.puniverses
+  | FCoFix of cofixpoint * fconstr subs Univ.puniverses
+  | FCaseT of case_info * constr * fconstr * constr array * fconstr subs Univ.puniverses (* predicate and branches are closures *)
+  | FLambda of int * (Name.t * constr) list * constr * fconstr subs Univ.puniverses
   | FProd of Name.t * fconstr * fconstr
-  | FLetIn of Name.t * fconstr * fconstr * constr * fconstr subs
-  | FEvar of existential * fconstr subs
+  | FLetIn of Name.t * fconstr * fconstr * constr * fconstr subs Univ.puniverses
+  | FEvar of existential * fconstr subs Univ.puniverses
   | FLIFT of int * fconstr
-  | FCLOS of constr * fconstr subs
+  | FUNIV of Univ.Instance.t * fconstr
+  | FCLOS of constr * fconstr subs Univ.puniverses
   | FLOCKED
 
 let fterm_of v = v.term
@@ -396,9 +404,10 @@ let update ~share v1 no t =
 
 type stack_member =
   | Zapp of fconstr array
-  | ZcaseT of case_info * constr * constr array * fconstr subs
+  | ZcaseT of case_info * constr * constr array * fconstr subs Univ.puniverses
   | Zproj of Projection.Repr.t
   | Zfix of fconstr * stack
+  | Zuniv of Univ.Instance.t
   | Zshift of int
   | Zupdate of fconstr
 
@@ -416,12 +425,27 @@ let zshift n s =
   match (n,s) with
       (0,_) -> s
     | (_,Zshift(k)::s) -> Zshift(n+k)::s
+    (* commutes with Zuniv *)
+    | (_,Zuniv(u)::Zshift(k)::s) -> assert false (* Zuniv(u)::Zshift(n+k)::s *)
+    | (_,Zuniv(u)::s) -> assert false (* Zuniv(u)::Zshift(n)::s *)
     | _ -> Zshift(n)::s
+
+(* Collapse universe substitutions in the stack.
+ * Note that they commute with shifts! *)
+let zuniv u s =
+  if Univ.Instance.is_empty u then s else
+  match s with
+  | Zuniv(u')::s -> assert false
+          (* let u'' = Univ.subst_instance_instance u' u in
+          if u'' == u' then s else
+          Zuniv u''::s *)
+  | _ -> assert false (* Zuniv(u)::s *)
 
 let rec stack_args_size = function
   | Zapp v :: s -> Array.length v + stack_args_size s
   | Zshift(_)::s -> stack_args_size s
   | Zupdate(_)::s -> stack_args_size s
+  | Zuniv(_)::s -> assert false (* stack_args_size s *)
   | _ -> 0
 
 (* When used as an argument stack (only Zapp can appear) *)
@@ -471,17 +495,80 @@ let rec lft_fconstr n ft =
   match ft.term with
     | (FInd _|FConstruct _|FFlex(ConstKey _|VarKey _)) -> ft
     | FRel i -> {norm=Norm;term=FRel(i+n)}
-    | FLambda(k,tys,f,e) -> {norm=Cstr; term=FLambda(k,tys,f,subs_shft(n,e))}
-    | FFix(fx,e) -> {norm=Cstr; term=FFix(fx,subs_shft(n,e))}
-    | FCoFix(cfx,e) -> {norm=Cstr; term=FCoFix(cfx,subs_shft(n,e))}
+    | FLambda(k,tys,f,e) -> {norm=Cstr; term=FLambda(k,tys,f,mapfstsnd subs_shft n e)}
+    | FFix(fx,e) -> {norm=Cstr; term=FFix(fx,mapfstsnd subs_shft n e)}
+    | FCoFix(cfx,e) -> {norm=Cstr; term=FCoFix(cfx,mapfstsnd subs_shft n e)}
     | FLIFT(k,m) -> lft_fconstr (n+k) m
     | FLOCKED -> assert false
-    | FFlex _ | FAtom _ | FApp _ | FProj _ | FCaseT _ | FProd _
+    | FFlex _ | FAtom _ | FApp _ | FProj _ | FCaseT _ | FProd _ | FUNIV _
       | FLetIn _ | FEvar _ | FCLOS _ -> {norm=ft.norm; term=FLIFT(n,ft)}
 let lift_fconstr k f =
   if Int.equal k 0 then f else lft_fconstr k f
-let lift_fconstr_vect k v =
-  if Int.equal k 0 then v else Array.Fun1.map lft_fconstr k v
+
+(* Universe substitution.  Preserves sharing where useful.
+   unv_fconstr sometimes creates a new cell, while univ_fconstr avoids it
+   where the universe is empty. *)
+let rec unv_fconstr u ft =
+  match ft.term with
+    | FInd(i,u') -> let u'' = Univ.subst_instance_instance u u' in
+                    if u'' == u' then ft else
+                        {norm=Norm; term=FInd(i,u'')}
+    | FConstruct(c,u') -> let u'' = Univ.subst_instance_instance u u' in
+                          if u' == u'' then ft else
+                            {norm=Cstr; term=FConstruct(c,u'')}
+    (* (* norm can be Red, but we share FFlex(ConstKey _) via the infos table,
+       not direct zupdate (i.e. we should never apply an update directly to
+       an FFlex, so losing sharing for it doesn't reallylose anything). *)
+    | FFlex(ConstKey(c,u')) -> let u' = Univ.subst_instance_instance u u' in
+                               if u' == u then ft else
+                                 {norm=ft.norm; term=FFlex(ConstKey(c,u'))} *)
+    | FAtom a ->
+            (match kind a with
+             | Sort (Sorts.Type u') ->
+               let u'' = Univ.subst_instance_universe u u' in
+               if u'' == u' then ft else
+                  {norm=Norm; term=FAtom(mkSort (Sorts.sort_of_univ u''))}
+             (* non-Sort Atoms are not universe polymorphic *)
+             | _ -> ft)
+    (* Vars and Rels are not universe polymorphic
+       (RelKeys cannot be referenced by constants and therefore always work in
+        an empty universe substitution context). *)
+    | FFlex(ConstKey (c,u')) -> let u'' = Univ.subst_instance_instance u u' in
+                                if u' == u'' then ft else
+                                    {norm=ft.norm; term=FFlex(ConstKey (c,u''))}
+    | FFlex(RelKey _|VarKey _) | FRel _ -> ft
+    (* No point in sharing these, as they can't reduce. *)
+    | FLambda(k,tys,f,e) ->
+            let u' = Univ.subst_instance_instance u (snd e) in
+            if u' == snd e then ft else
+              {norm=Cstr; term=FLambda(k,tys,f,(fst e, u'))}
+    | FFix(fx,e) ->
+            let u' = Univ.subst_instance_instance u (snd e) in
+            if u' == snd e then ft else
+              {norm=Cstr; term=FFix(fx,(fst e, u'))}
+    | FCoFix(cfx,e) ->
+            let u' = Univ.subst_instance_instance u (snd e) in
+            if u' == snd e then ft else
+              {norm=Cstr; term=FCoFix(cfx,(fst e, u'))}
+    (* Commutes with lifts.  Note that we remove zero-sized lifts here because
+       the new univ node should ensure sharing where it's useful (all nodes
+       that don't get wrapped in a universe instance don't have norm=Red, or
+       are FFlex(ConstKey) which is shared via the infos table). *)
+    (* commutes with lifts. *)
+    | FLIFT(k,m) -> lft_fconstr k (unv_fconstr u m)
+    | FUNIV(u',m) -> assert false (* unv_fconstr (Univ.subst_instance_instance u u') m *)
+    | FLOCKED -> assert false
+    | (*FFlex _ | *) FApp _ | FProj _ | FCaseT _ | FProd _ | FLetIn _
+      | FEvar _ | FCLOS _ -> assert false (* {norm=ft.norm; term=FUNIV(u,ft)} *)
+let univ_fconstr u f =
+  if Univ.Instance.is_empty u then f else unv_fconstr u f
+
+let univ_lift_fconstr_vect k subst v =
+  match subst with
+  | [] -> if Int.equal k 0 then v else Array.Fun1.map lft_fconstr k v
+  | u::_ -> if Int.equal k 0 then Array.Fun1.map unv_fconstr u v else
+               Array.Fun1.map (fun (k,u) c -> lft_fconstr k (univ_fconstr u c))
+                              (k,u) v
 
 let clos_rel e i =
   match expand_rel i e with
@@ -492,17 +579,21 @@ let clos_rel e i =
 
 (* since the head may be reducible, we might introduce lifts of 0 *)
 let compact_stack head stk =
-  let rec strip_rec depth = function
-    | Zshift(k)::s -> strip_rec (depth+k) s
+  let rec strip_rec depth u = function
+    | Zshift(k)::s -> strip_rec (depth+k) u s
+    | Zuniv(u')::s -> (*strip_rec depth (if Univ.Instance.is_empty u then u' else
+                                       Univ.subst_instance_instance u' u) s*)assert false
     | Zupdate(m)::s ->
         (* Be sure to create a new cell otherwise sharing would be
            lost by the update operation *)
-        let h' = lft_fconstr depth head in
+        (* TODO: see if we can avoid creating empty lifts sometimes because the
+           UNIV already provides enough sharing. *)
+        let h' = lft_fconstr depth (univ_fconstr u head) in
         (** The stack contains [Zupdate] marks only if in sharing mode *)
         let _ = update ~share:true m h'.norm h'.term in
-        strip_rec depth s
-    | stk -> zshift depth stk in
-  strip_rec 0 stk
+        strip_rec depth u s
+    | stk -> zuniv u (zshift depth stk) in
+  strip_rec 0 Univ.Instance.empty stk
 
 (* Put an update mark in the stack, only if needed *)
 let zupdate info m s =
@@ -520,9 +611,9 @@ let mk_lambda env t =
 
 let destFLambda clos_fun t =
   match t.term with
-      FLambda(_,[(na,ty)],b,e) -> (na,clos_fun e ty,clos_fun (subs_lift e) b)
+      FLambda(_,[(na,ty)],b,e) -> (na,clos_fun e ty,clos_fun (mapfst subs_lift e) b)
     | FLambda(n,(na,ty)::tys,b,e) ->
-        (na,clos_fun e ty,{norm=Cstr;term=FLambda(n-1,tys,b,subs_lift e)})
+        (na,clos_fun e ty,{norm=Cstr;term=FLambda(n-1,tys,b,mapfst subs_lift e)})
     | _ -> assert false
 	(* t must be a FLambda and binding list cannot be empty *)
 
@@ -530,12 +621,16 @@ let destFLambda clos_fun t =
    Makes variable access much faster *)
 let mk_clos e t =
   match kind t with
-    | Rel i -> clos_rel e i
+    | Rel i -> clos_rel (fst e) i
     | Var x -> { norm = Red; term = FFlex (VarKey x) }
-    | Const c -> { norm = Red; term = FFlex (ConstKey c) }
-    | Meta _ | Sort _ ->  { norm = Norm; term = FAtom t }
-    | Ind kn -> { norm = Norm; term = FInd kn }
-    | Construct kn -> { norm = Cstr; term = FConstruct kn }
+    | Const (c, u) ->
+      univ_fconstr (snd e)
+                   (*( univ_fconstr u *){ norm = Red;
+                                     term = FFlex (ConstKey (c,(*Univ.Instance.empty*)u)) }(* ) *)
+    | Sort _ -> univ_fconstr (snd e) { norm = Norm; term = FAtom t }
+    | Ind kn -> univ_fconstr (snd e) { norm = Norm; term = FInd kn }
+    | Construct kn -> univ_fconstr (snd e) { norm = Cstr; term = FConstruct kn }
+    | Meta _ -> { norm = Norm; term = FAtom t }
     | (CoFix _|Lambda _|Fix _|Prod _|Evar _|App _|Case _|Cast _|LetIn _|Proj _) ->
         {norm = Red; term = FCLOS(t,e)}
 
@@ -550,41 +645,87 @@ let mk_clos_vect env v = match v with
   [|mk_clos env v0; mk_clos env v1; mk_clos env v2; mk_clos env v3|]
 | v -> Array.Fun1.map mk_clos env v
 
+(* Custom version of exliftn that simltaneously applies substitutions. *)
+let rec exliftn_subst subst c = match Constr.kind c with
+  | Constr.Rel i -> Constr.mkRel(reloc_rel i (fst subst))
+  | Const _ | Ind _ | Construct _ | Sort (Sorts.Type _) ->
+    (* Feedback.msg_debug Pp.(str "At an atom (exliftn_subst): " (*++ ppconstr v*) ++ str "@" ++ Univ.Instance.pr Univ.Level.pr (snd subst)); *)
+    subst_instance_constr (snd subst) c
+  | _ -> Constr.map_with_binders (mapfst el_lift) exliftn_subst subst c
+
+let liftn_subst subst n k c =
+  match el_liftn (pred k) (el_shft n el_id) with
+    | ELID -> if Univ.Instance.is_empty subst then c else
+                 subst_instance_constr subst c
+    | el -> if Univ.Instance.is_empty subst then exliftn el c else
+               exliftn_subst (el,subst) c
+
+let lift_subst subst n = liftn_subst subst n 1
+
+(* (* Compose two instances that are both substitutions.
+   NOTE: correctness depends on first substitution being immediately before
+         the second, meaning that either the first substitution is empty, or
+         it contains all instances required by the second.  We also assume
+         an FUNIV always surrounds a FFlex(ConstKey _), so we never apply to
+         an empty substitution unless we have to. *)
+if Univ.Instance.empty subst then subst' else
+   Univ.subst_instance_instance subst subst' *)
+
 (* The inverse of mk_clos: move back to constr *)
 let rec to_constr lfts v =
   match v.term with
-    | FRel i -> mkRel (reloc_rel i lfts)
-    | FFlex (RelKey p) -> mkRel (reloc_rel p lfts)
+    | FRel i -> mkRel (reloc_rel i (fst lfts))
+    | FFlex (RelKey p) -> mkRel (reloc_rel p (fst lfts))
     | FFlex (VarKey x) -> mkVar x
-    | FAtom c -> exliftn lfts c
-    | FFlex (ConstKey op) -> mkConstU op
-    | FInd op -> mkIndU op
-    | FConstruct op -> mkConstructU op
-    | FCaseT (ci,p,c,ve,env) ->
-      if is_subs_id env && is_lift_id lfts then
+    | FAtom c -> exliftn_subst lfts c
+    | FFlex (ConstKey ((kn,u) as op)) ->
+        let subst = snd lfts in
+        mkConstU (if Univ.Instance.is_empty subst || Univ.Instance.is_empty u then op else
+                  let u' = Univ.subst_instance_instance subst u in
+                  if u' == u then op else (kn,u'))
+    | FInd ((i,u) as op) ->
+      let subst = snd lfts in
+      mkIndU (if Univ.Instance.is_empty subst || Univ.Instance.is_empty u then op else
+              let u' = Univ.subst_instance_instance subst u in
+              if u' == u then op else (i,u'))
+    | FConstruct ((c,u) as op) ->
+      let subst = snd lfts in
+      mkConstructU (if Univ.Instance.is_empty subst || Univ.Instance.is_empty u then op else
+                    let u' = Univ.subst_instance_instance subst u in
+                    if u' == u then op else (c,u'))
+    | FCaseT (ci,p,c,ve,((env,subst) as e)) ->
+      if is_subs_id env && Univ.Instance.is_empty subst &&
+         is_lift_id (fst lfts) && Univ.Instance.is_empty (snd lfts) then
         mkCase (ci, p, to_constr lfts c, ve)
       else
-        let subs = comp_subs lfts env in
+        (* to_constr lfts (mk_clos2 e p)
+           to_constr lfts c
+           Array.map (to_constr lfts) (mk_clos_vect e ve) *)
+        let subs = comp_subs lfts e in
         mkCase (ci, subst_constr subs p,
             to_constr lfts c,
             Array.map (fun b -> subst_constr subs b) ve)
-    | FFix ((op,(lna,tys,bds)) as fx, e) ->
-      if is_subs_id e && is_lift_id lfts then
+    | FFix ((op,(lna,tys,bds)) as fx, ((e, subst) as env)) ->
+      if is_subs_id e && Univ.Instance.is_empty subst &&
+         is_lift_id (fst lfts) && Univ.Instance.is_empty (snd lfts) then
         mkFix fx
       else
         let n = Array.length bds in
-        let subs_ty = comp_subs lfts e in
-        let subs_bd = comp_subs (el_liftn n lfts) (subs_liftn n e) in
+        let subs_ty = comp_subs lfts env in
+        let subs_bd = comp_subs (mapfst (el_liftn n) lfts)
+                                (mapfst (subs_liftn n) env) in
         let tys = Array.Fun1.map subst_constr subs_ty tys in
         let bds = Array.Fun1.map subst_constr subs_bd bds in
         mkFix (op, (lna, tys, bds))
-    | FCoFix ((op,(lna,tys,bds)) as cfx, e) ->
-      if is_subs_id e && is_lift_id lfts then
+    | FCoFix ((op,(lna,tys,bds)) as cfx, ((e, subst) as env)) ->
+      if is_subs_id e && Univ.Instance.is_empty subst &&
+         is_lift_id (fst lfts) && Univ.Instance.is_empty (snd lfts) then
         mkCoFix cfx
       else
         let n = Array.length bds in
-        let subs_ty = comp_subs lfts e in
-        let subs_bd = comp_subs (el_liftn n lfts) (subs_liftn n e) in
+        let subs_ty = comp_subs lfts env in
+        let subs_bd = comp_subs (mapfst (el_liftn n) lfts)
+                                (mapfst (subs_liftn n) env) in
         let tys = Array.Fun1.map subst_constr subs_ty tys in
         let bds = Array.Fun1.map subst_constr subs_bd bds in
         mkCoFix (op, (lna, tys, bds))
@@ -594,50 +735,68 @@ let rec to_constr lfts v =
     | FProj (p,c) ->
         mkProj (p,to_constr lfts c)
 
-    | FLambda (len, tys, f, e) ->
-      if is_subs_id e && is_lift_id lfts then
+    | FLambda (len, tys, f, ((e, subst) as env)) ->
+      if is_subs_id e && Univ.Instance.is_empty subst &&
+         is_lift_id (fst lfts) && Univ.Instance.is_empty (snd lfts) then
         Term.compose_lam (List.rev tys) f
       else
-        let subs = comp_subs lfts e in
-        let tys = List.mapi (fun i (na, c) -> na, subst_constr (subs_liftn i subs) c) tys in
-        let f = subst_constr (subs_liftn len subs) f in
+        let subs = comp_subs lfts env in
+        let tys = List.mapi (fun i (na, c) ->
+                             na, subst_constr (mapfst (subs_liftn i) subs) c)
+                            tys in
+        let f = subst_constr (mapfst (subs_liftn len) subs) f in
         Term.compose_lam (List.rev tys) f
     | FProd (n,t,c)   ->
         mkProd (n, to_constr lfts t,
-                   to_constr (el_lift lfts) c)
-    | FLetIn (n,b,t,f,e) ->
-      let subs = comp_subs (el_lift lfts) (subs_lift e) in
+                   to_constr (mapfst el_lift lfts) c)
+    | FLetIn (n,b,t,f, env) ->
+      let subs = comp_subs (mapfst el_lift lfts) (mapfst subs_lift env) in
         mkLetIn (n, to_constr lfts b,
                     to_constr lfts t,
                     subst_constr subs f)
-    | FEvar ((ev,args),env) ->
-      let subs = comp_subs lfts env in
+    | FEvar ((ev,args),e) ->
+      let subs = comp_subs lfts e in
         mkEvar(ev,Array.map (fun a -> subst_constr subs a) args)
-    | FLIFT (k,a) -> to_constr (el_shft k lfts) a
-    | FCLOS (t,env) ->
-      if is_subs_id env && is_lift_id lfts then t
+    | FLIFT (k,a) -> to_constr (mapfst (el_shft k) lfts) a
+    | FUNIV (u,a) -> assert false (*
+      let subst = snd lfts in
+      let subst' = if Univ.Instance.is_empty subst then u else
+                   Univ.subst_instance_instance subst u in
+      to_constr (fst lfts, subst') a *)
+    | FCLOS (t,((env, subst) as e)) ->
+      if is_subs_id env && Univ.Instance.is_empty subst &&
+         is_lift_id (fst lfts) && Univ.Instance.is_empty (snd lfts) then
+        t
       else
-        let subs = comp_subs lfts env in
+        let subs = comp_subs lfts e in
         subst_constr subs t
     | FLOCKED -> assert false (*mkVar(Id.of_string"_LOCK_")*)
 
 and subst_constr subst c = match Constr.kind c with
 | Rel i ->
-  begin match expand_rel i subst with
-  | Inl (k, lazy v) -> Vars.lift k v
+  begin match expand_rel i (fst subst) with
+  | Inl (k, lazy v) ->
+          (* Feedback.msg_debug Pp.(str "Got to v: " (*++ ppconstr v*) ++ str "@" ++ Univ.Instance.pr Univ.Level.pr (snd subst)); *)
+         (* lift_subst (snd subst) k v *)
+          (Vars.lift k v)
   | Inr (m, _) -> mkRel m
   end
+| Const _ | Ind _ | Construct _ | Sort (Sorts.Type _) ->
+  (* Feedback.msg_debug Pp.(str "At an atom: " (*++ ppconstr v*) ++ str "@" ++ Univ.Instance.pr Univ.Level.pr (snd subst)); *)
+  subst_instance_constr (snd subst) c
 | _ ->
-  Constr.map_with_binders Esubst.subs_lift subst_constr subst c
+  Constr.map_with_binders (mapfst Esubst.subs_lift) subst_constr subst c
 
-and comp_subs el s =
-  Esubst.lift_subst (fun el c -> lazy (to_constr el c)) el s
+and comp_subs (el,subst) (s,subst') =
+  let subst'' = if Univ.Instance.is_empty subst (*|| Univ.Instance.is_empty subst'*) then subst' else
+                Univ.subst_instance_instance subst subst' in
+  (Esubst.lift_subst (fun el c -> lazy (to_constr (el,subst) c)) el s, subst'')
 
 (* This function defines the correspondance between constr and
    fconstr. When we find a closure whose substitution is the identity,
    then we directly return the constr to avoid possibly huge
    reallocation. *)
-let term_of_fconstr c = to_constr el_id c
+let term_of_fconstr c = to_constr (el_id,Univ.Instance.empty) c
 
 (* fstrong applies unfreeze_fun recursively on the (freeze) term and
  * yields a term.  Assumes that the unfreeze_fun never returns a
@@ -659,6 +818,8 @@ let rec zip m stk =
         zip fx (par @ append_stack [|m|] s)
     | Zshift(n)::s ->
         zip (lift_fconstr n m) s
+    | Zuniv(u)::s ->
+        (* zip (univ_fconstr u m) s *) assert false
     | Zupdate(rf)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
         zip (update ~share:true rf m.norm m.term) s
@@ -672,19 +833,34 @@ let fapp_stack (m,stk) = zip m stk
    (strip_update_shift_app), a fix (get_nth_arg) or an abstraction
    (strip_update_shift, through get_arg). *)
 
+(* Idea: if you have an empty substitution, just take the whole left hand side.
+   For any other (nonempty) substitution, subst_instance_instance; this should
+   be valid because the rhs will always index into its immediate lhs. *)
+
 (* optimised for the case where there are no shifts... *)
 let strip_update_shift_app_red head stk =
-  let rec strip_rec rstk h depth = function
+  let rec strip_rec rstk h depth subst = function
     | Zshift(k) as e :: s ->
-        strip_rec (e::rstk) (lift_fconstr k h) (depth+k) s
+        strip_rec (e::rstk) (lift_fconstr k h) (depth+k) subst s
+    | Zuniv(u) as e :: s ->
+        (* strip_rec (e::rstk) (univ_fconstr u h) depth
+                  (u::subst) s
+                  (* (match subst with
+                   | [] -> [u]
+                   | u'::substs -> Univ.subst_instance_instance u u'::subst) *) *) assert false
     | (Zapp args :: s) ->
         strip_rec (Zapp args :: rstk)
-          {norm=h.norm;term=FApp(h,args)} depth s
+          {norm=h.norm;term=FApp(h,args)} depth subst s
     | Zupdate(m)::s ->
       (** The stack contains [Zupdate] marks only if in sharing mode *)
-        strip_rec rstk (update ~share:true m h.norm h.term) depth s
-    | stk -> (depth,List.rev rstk, stk) in
-  strip_rec [] head 0 stk
+        strip_rec rstk (update ~share:true m h.norm h.term) depth subst s
+    | stk -> (depth, List.fold_left (fun subst u ->
+                                     (match subst with
+                                     | [] -> u
+                                     | u'::_ -> Univ.subst_instance_instance u' u)::subst)
+                                    [] subst,
+              List.rev rstk, stk) in
+  strip_rec [] head 0 [] stk
 
 let strip_update_shift_app head stack =
   assert (match head.norm with Red -> false | _ -> true);
@@ -695,6 +871,8 @@ let get_nth_arg head n stk =
   let rec strip_rec rstk h n = function
     | Zshift(k) as e :: s ->
         strip_rec (e::rstk) (lift_fconstr k h) n s
+    | Zuniv(u) as e :: s ->
+        (* strip_rec (e::rstk) (univ_fconstr u h) n s *) assert false
     | Zapp args::s' ->
         let q = Array.length args in
         if n >= q
@@ -712,66 +890,141 @@ let get_nth_arg head n stk =
     | s -> (None, List.rev rstk @ s) in
   strip_rec [] head n stk
 
+(* Beta reduction: *)
+
+(* optimised for the case where there are no universe substitutions...
+   NOTE: the reason this must be done separately is that Esubst.subs
+         cannot handle universe substitutions mixed with regular
+         argument substitutions.  It might otherwise be possible to
+         make this more efficient. *)
+let get_args_univ n stk =
+  let rec strip_rec subst n = function
+    | Zupdate _ :: s -> strip_rec subst n s
+    | Zshift _ :: s -> strip_rec subst n s
+    | Zuniv u :: s -> (* strip_rec (u::subst) n s *) assert false
+    | Zapp l :: s ->
+        let na = Array.length l in
+        if n <= na then subst
+        else (* more lambdas *)
+          strip_rec subst (n-na) s
+    | _ -> subst in
+  let subst = strip_rec [] n stk in
+  List.fold_left (fun subst u ->
+                  (match subst with
+                   | [] -> u
+                   | u'::_ -> Univ.subst_instance_instance u' u)::subst)
+                 [] subst
+
 (* Beta reduction: look for an applied argument in the stack.
    Since the encountered update marks are removed, h must be a whnf *)
-let rec get_args n tys f e stk =
+let rec get_args n tys f e subst stk =
   match stk with
       Zupdate r :: s ->
         (** The stack contains [Zupdate] mark only if in sharing mode *)
         let _hd = update ~share:true r Cstr (FLambda(n,tys,f,e)) in
-        get_args n tys f e s
+        get_args n tys f e subst s
     | Zshift k :: s ->
-        get_args n tys f (subs_shft (k,e)) s
+        get_args n tys f (mapfstsnd subs_shft k e) subst s
+    | Zuniv u :: s ->
+        (* We know (tl subst) must be nonempty here since we ran
+         * get_args_univ n stk to get subst initially *)
+        (* get_args n tys f (fst e, if Univ.Instance.is_empty (snd e) then u else
+                                    Univ.subst_instance_instance u (snd e))
+                 (List.tl subst) s *)
+        assert false
     | Zapp l :: s ->
         let na = Array.length l in
-        if n == na then (Inl (subs_cons(l,e)),s)
+        (* We know subst must be [] if n <= na *)
+        if n == na then (Inl (mapfstsnd subs_cons l e),s)
         else if n < na then (* more arguments *)
           let args = Array.sub l 0 n in
           let eargs = Array.sub l n (na-n) in
-          (Inl (subs_cons(args,e)), Zapp eargs :: s)
+          (Inl (mapfstsnd subs_cons args e), Zapp eargs :: s)
         else (* more lambdas *)
           let etys = List.skipn na tys in
-          get_args (n-na) etys f (subs_cons(l,e)) s
+          (* We must apply any delayed universe substitutions to l, because
+             otherwise l will not be evaluated in the correct context. *)
+          let args = univ_lift_fconstr_vect 0 subst l in
+          get_args (n-na) etys f (mapfstsnd subs_cons args e) subst s
     | _ -> (Inr {norm=Cstr;term=FLambda(n,tys,f,e)}, stk)
 
 (* Eta expansion: add a reference to implicit surrounding lambda at end of stack *)
 let rec eta_expand_stack = function
   | (Zapp _ | Zfix _ | ZcaseT _ | Zproj _
-	| Zshift _ | Zupdate _ as e) :: s ->
+    | Zshift _ | Zuniv _ | Zupdate _ as e) :: s ->
       e :: eta_expand_stack s
   | [] ->
       [Zshift 1; Zapp [|{norm=Norm; term= FRel 1}|]]
 
 (* Iota reduction: extract the arguments to be passed to the Case
    branches *)
-let rec reloc_rargs_rec depth stk =
+let rec reloc_rargs_rec depth subst stk =
   match stk with
       Zapp args :: s ->
-        Zapp (lift_fconstr_vect depth args) :: reloc_rargs_rec depth s
-    | Zshift(k)::s -> if Int.equal k depth then s else reloc_rargs_rec (depth-k) s
+        let args' = univ_lift_fconstr_vect depth subst args in
+        Zapp args' :: reloc_rargs_rec depth subst s
+    | Zuniv(_)::s ->
+        assert false
+        (*
+        (* tl must exist, since subst was built up by strip_update_shift_app *)
+        (match List.tl subst with
+         | [] when Int.equal depth 0 -> s
+         | subst' -> reloc_rargs_rec depth subst' s)
+        (* Have : u and a substitution subst = S ∘ u
+           Is it possible to uniquely determine S from subst and u?
+           Answer : we know that subst(0) = S(u(0)), so
+           S(u(0)) = subst(0);
+           S(u(1)) = subst(1);
+           ...
+           S(u(n)) = subst(n).
+
+           But what about i where i ∈ dom(u), but ¬(∃ k. u(k) = i)?  Then
+           we don't know the value of S(i) from the above, but we can't
+           assume S(i) = subst(i) because subst(i) was remapped by u.
+
+           For instance:
+               u(0) = 0
+               u(1) = 0
+
+               subst(0) = 0
+               subst(1) = 0
+
+               Then S(u(0)) = subst(0) = 0 and S(u(1)) = subst(1) = 0; but
+               both tell you that S(0) = 0 (redundant information).  Neither
+               tells you what S(1) was; it has been erased.
+
+               On the other hand, if we remember each universe substitution as we
+               walk up the stack, we can do better, by simply shedding one every
+               time we see a Zuniv.
+           *) *)
+    | Zshift(k)::s -> if Int.equal k depth && subst = [] then s else
+                         reloc_rargs_rec (depth-k) subst s
     | _ -> stk
 
-let reloc_rargs depth stk =
-  if Int.equal depth 0 then stk else reloc_rargs_rec depth stk
+let reloc_rargs depth subst stk =
+  if Int.equal depth 0 && subst = [] then stk else
+     reloc_rargs_rec depth subst stk
 
-let rec try_drop_parameters depth n argstk =
+let rec try_drop_parameters depth subst n argstk =
   match argstk with
       Zapp args::s ->
         let q = Array.length args in
-        if n > q then try_drop_parameters depth (n-q) s
-        else if Int.equal n q then reloc_rargs depth s
+        if n > q then try_drop_parameters depth subst (n-q) s
+        else if Int.equal n q then reloc_rargs depth subst s
         else
           let aft = Array.sub args n (q-n) in
-          reloc_rargs depth (append_stack aft s)
-    | Zshift(k)::s -> try_drop_parameters (depth-k) n s
+          reloc_rargs depth subst (append_stack aft s)
+    | Zshift(k)::s -> try_drop_parameters (depth-k) subst n s
+    (* tl must exist, since subst was built up by strip_update_shift_app *)
+    | Zuniv _::s -> assert false (* try_drop_parameters depth (List.tl subst) n s *)
     | [] ->
 	if Int.equal n 0 then []
 	else raise Not_found
     | _ -> assert false
 	(* strip_update_shift_app only produces Zapp and Zshift items *)
 
-let drop_parameters depth n argstk =
-  try try_drop_parameters depth n argstk
+let drop_parameters depth subst n argstk =
+  try try_drop_parameters depth subst n argstk
   with Not_found ->
   (* we know that n < stack_args_size(argstk) (if well-typed term) *)
   anomaly (Pp.str "ill-typed term: found a match on a partially applied constructor.")
@@ -796,9 +1049,9 @@ let eta_expand_ind_stack env ind m s (f, s') =
 	   arg1..argn ~= (proj1 t...projn t) where t = zip (f,s') *)
     let pars = mib.Declarations.mind_nparams in
     let right = fapp_stack (f, s') in
-    let (depth, args, _s) = strip_update_shift_app m s in
+    let (depth, subst, args, _s) = strip_update_shift_app m s in
     (** Try to drop the params, might fail on partially applied constructors. *)
-    let argss = try_drop_parameters depth pars args in
+    let argss = try_drop_parameters depth subst pars args in
     let hstack = Array.map (fun p ->
         { norm = Red; (* right can't be a constructor though *)
           term = FProj (Projection.make p true, right) })
@@ -839,7 +1092,7 @@ let contract_fix_vect fix =
 	   env, Array.length bds)
       | _ -> assert false
   in
-  (subs_cons(Array.init nfix make_body, env), thisbody)
+  (mapfstsnd subs_cons (Array.init nfix make_body) env, thisbody)
 
 let unfold_projection info p =
   if red_projection info.i_flags p
@@ -855,6 +1108,7 @@ let unfold_projection info p =
 let rec knh info m stk =
   match m.term with
     | FLIFT(k,a) -> knh info a (zshift k stk)
+    | FUNIV(u,a) -> assert false (* knh info a (zuniv u stk) *)
     | FCLOS(t,e) -> knht info e t (zupdate info m stk)
     | FLOCKED -> assert false
     | FApp(a,b) -> knh info a (append_stack b (zupdate info m stk))
@@ -882,13 +1136,14 @@ and knht info e t stk =
         knht info e t (ZcaseT(ci, p, br, e)::stk)
     | Fix fx -> knh info { norm = Cstr; term = FFix (fx, e) } stk
     | Cast(a,_,_) -> knht info e a stk
-    | Rel n -> knh info (clos_rel e n) stk
+    | Rel n -> knh info (clos_rel (fst e) n) stk
     | Proj (p, c) -> knh info { norm = Red; term = FProj (p, mk_clos e c) } stk
-    | (Ind _|Const _|Construct _|Var _|Meta _ | Sort _) -> (mk_clos e t, stk)
+    | Const _ -> knh info (mk_clos e t) stk
+    | (Ind _|Construct _|Var _|Meta _ | Sort _) -> (mk_clos e t, stk)
     | CoFix cfx -> { norm = Cstr; term = FCoFix (cfx,e) }, stk
     | Lambda _ -> { norm = Cstr; term = mk_lambda e t }, stk
     | Prod (n, t, c) ->
-      { norm = Whnf; term = FProd (n, mk_clos e t, mk_clos (subs_lift e) c) }, stk
+      { norm = Whnf; term = FProd (n, mk_clos e t, mk_clos (mapfst subs_lift e) c) }, stk
     | LetIn (n,b,t,c) ->
       { norm = Red; term = FLetIn (n, mk_clos e b, mk_clos e t, c, e) }, stk
     | Evar ev -> { norm = Red; term = FEvar (ev, e) }, stk
@@ -900,7 +1155,7 @@ and knht info e t stk =
 let rec knr info tab m stk =
   match m.term with
   | FLambda(n,tys,f,e) when red_set info.i_flags fBETA ->
-      (match get_args n tys f e stk with
+      (match get_args n tys f e (get_args_univ n stk) stk with
           Inl e', s -> knit info tab e' f s
         | Inr lam, s -> (lam,s))
   | FFlex(ConstKey (kn,_ as c)) when red_set info.i_flags (fCONST kn) ->
@@ -920,29 +1175,30 @@ let rec knr info tab m stk =
      let use_fix = red_set info.i_flags fFIX in
      if use_match || use_fix then
       (match strip_update_shift_app m stk with
-        | (depth, args, ZcaseT(ci,_,br,e)::s) when use_match ->
+        | (depth, subst, args, ZcaseT(ci,_,br,e)::s) when use_match ->
             assert (ci.ci_npar>=0);
-            let rargs = drop_parameters depth ci.ci_npar args in
+            let rargs = drop_parameters depth subst ci.ci_npar args in
             knit info tab e br.(c-1) (rargs@s)
-        | (_, cargs, Zfix(fx,par)::s) when use_fix ->
+        | (_, _, cargs, Zfix(fx,par)::s) when use_fix ->
             let rarg = fapp_stack(m,cargs) in
             let stk' = par @ append_stack [|rarg|] s in
             let (fxe,fxbd) = contract_fix_vect fx.term in
             knit info tab fxe fxbd stk'
-        | (depth, args, Zproj p::s) when use_match ->
-            let rargs = drop_parameters depth (Projection.Repr.npars p) args in
+        | (depth, subst, args, Zproj p::s) when use_match ->
+            let rargs = drop_parameters depth subst
+                                        (Projection.Repr.npars p) args in
             let rarg = project_nth_arg (Projection.Repr.arg p) rargs in
             kni info tab rarg s
-        | (_,args,s) -> (m,args@s))
+        | (_, _, args,s) -> (m,args@s))
      else (m,stk)
   | FCoFix _ when red_set info.i_flags fCOFIX ->
       (match strip_update_shift_app m stk with
-          (_, args, (((ZcaseT _|Zproj _)::_) as stk')) ->
+          (_, _, args, (((ZcaseT _|Zproj _)::_) as stk')) ->
             let (fxe,fxbd) = contract_fix_vect m.term in
             knit info tab fxe fxbd (args@stk')
-        | (_,args,s) -> (m,args@s))
+        | (_,_, args,s) -> (m,args@s))
   | FLetIn (_,v,_,bd,e) when red_set info.i_flags fZETA ->
-      knit info tab (subs_cons([|v|],e)) bd stk
+      knit info tab (mapfstsnd subs_cons [|v|] e) bd stk
   | FEvar(ev,env) ->
       (match evar_value info.i_cache ev with
           Some c -> knit info tab env c stk
@@ -950,6 +1206,7 @@ let rec knr info tab m stk =
   | FLOCKED | FRel _ | FAtom _ | FFlex _ | FInd _ | FApp _ | FProj _
     | FFix _ | FCoFix _ | FCaseT _ | FLambda _ | FProd _ | FLetIn _ | FLIFT _
     | FCLOS _ -> (m, stk)
+    | FUNIV _ -> assert false (* (m, stk) *)
 
 
 (* Computes the weak head normal form of a term *)
@@ -981,6 +1238,8 @@ let rec zip_term zfun m stk =
         zip_term zfun h s
     | Zshift(n)::s ->
         zip_term zfun (lift n m) s
+    | Zuniv(u)::s ->
+        (* zip_term zfun (subst_instance_constr u m) s *) assert false
     | Zupdate(_rf)::s ->
         zip_term zfun m s
 
@@ -1004,24 +1263,24 @@ and norm_head info tab m =
       | FLambda(_n,tys,f,e) ->
           let (e',rvtys) =
             List.fold_left (fun (e,ctxt) (na,ty) ->
-              (subs_lift e, (na,kl info tab (mk_clos e ty))::ctxt))
+              (mapfst subs_lift e, (na,kl info tab (mk_clos e ty))::ctxt))
               (e,[]) tys in
           let bd = kl info tab (mk_clos e' f) in
           List.fold_left (fun b (na,ty) -> mkLambda(na,ty,b)) bd rvtys
       | FLetIn(na,a,b,f,e) ->
-          let c = mk_clos (subs_lift e) f in
+          let c = mk_clos (mapfst subs_lift e) f in
           mkLetIn(na, kl info tab a, kl info tab b, kl info tab c)
       | FProd(na,dom,rng) ->
           mkProd(na, kl info tab dom, kl info tab rng)
       | FCoFix((n,(na,tys,bds)),e) ->
           let ftys = Array.Fun1.map mk_clos e tys in
           let fbds =
-            Array.Fun1.map mk_clos (subs_liftn (Array.length na) e) bds in
+            Array.Fun1.map mk_clos (mapfst (subs_liftn (Array.length na)) e) bds in
           mkCoFix(n,(na, CArray.map (kl info tab) ftys, CArray.map (kl info tab) fbds))
       | FFix((n,(na,tys,bds)),e) ->
           let ftys = Array.Fun1.map mk_clos e tys in
           let fbds =
-            Array.Fun1.map mk_clos (subs_liftn (Array.length na) e) bds in
+            Array.Fun1.map mk_clos (mapfst (subs_liftn (Array.length na)) e) bds in
           mkFix(n,(na, CArray.map (kl info tab) ftys, CArray.map (kl info tab) fbds))
       | FEvar((i,args),env) ->
           mkEvar(i, Array.map (fun a -> kl info tab (mk_clos env a)) args)
@@ -1029,6 +1288,7 @@ and norm_head info tab m =
           mkProj (p, kl info tab c)
       | FLOCKED | FRel _ | FAtom _ | FFlex _ | FInd _ | FConstruct _
         | FApp _ | FCaseT _ | FLIFT _ | FCLOS _ -> term_of_fconstr m
+        | FUNIV _ -> assert false (* term_of_fconstr m *)
 
 (* Initialization and then normalization *)
 
@@ -1040,7 +1300,7 @@ let whd_val info tab v =
 let norm_val info tab v =
   with_stats (lazy (kl info tab v))
 
-let inject c = mk_clos (subs_id 0) c
+let inject (c,u) = mk_clos (subs_id 0, u) c
 
 let whd_stack infos tab m stk = match m.norm with
 | Whnf | Norm ->

@@ -1237,7 +1237,7 @@ let clos_norm_flags flgs env sigma t =
     EConstr.of_constr (CClosure.norm_val
       (CClosure.create_clos_infos ~evars flgs env)
       (CClosure.create_tab ())
-      (CClosure.inject (EConstr.Unsafe.to_constr t)))
+      (CClosure.inject (EConstr.Unsafe.to_constr t, Instance.empty)))
   with e when is_anomaly e -> user_err Pp.(str "Tried to normalize ill-typed term")
 
 let clos_whd_flags flgs env sigma t =
@@ -1246,7 +1246,7 @@ let clos_whd_flags flgs env sigma t =
     EConstr.of_constr (CClosure.whd_val
       (CClosure.create_clos_infos ~evars flgs env)
       (CClosure.create_tab ())
-      (CClosure.inject (EConstr.Unsafe.to_constr t)))
+      (CClosure.inject (EConstr.Unsafe.to_constr t, Instance.empty)))
   with e when is_anomaly e -> user_err Pp.(str "Tried to normalize ill-typed term")
 
 let nf_beta = clos_norm_flags CClosure.beta
@@ -1365,6 +1365,8 @@ let infer_conv_gen conv_fun ?(catch_incon=true) ?(pb=Reduction.CUMUL)
       | None ->
         let x = EConstr.Unsafe.to_constr x in
         let y = EConstr.Unsafe.to_constr y in
+        (* let open Univ in
+        Feedback.msg_debug Pp.(str "In universe context: " ++ pr_universe_context Univ.Level.pr (Evd.to_universe_context sigma))(* ++ str "@" ++ Univ.Instance.pr Univ.Level.pr (snd lft2) ++ str " with suspended " ++ Univ.Instance.pr Univ.Level.pr (snd (el_stack lft2 v2)));*); *)
 	let sigma' = 
 	  conv_fun pb ~l2r:false sigma ts
 	    env (sigma, sigma_univ_state) x y in

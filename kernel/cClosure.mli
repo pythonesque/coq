@@ -106,7 +106,7 @@ type 'a infos = {
 
 val ref_value_cache: 'a infos -> 'a infos_tab -> table_key -> 'a option
 val create:
-  repr:('a infos -> 'a infos_tab -> constr -> 'a) ->
+  repr:('a infos -> 'a infos_tab -> constr Univ.puniverses -> 'a) ->
   share:bool ->
   reds ->
   env ->
@@ -136,15 +136,16 @@ type fterm =
   | FConstruct of constructor Univ.puniverses
   | FApp of fconstr * fconstr array
   | FProj of Projection.t * fconstr
-  | FFix of fixpoint * fconstr subs
-  | FCoFix of cofixpoint * fconstr subs
-  | FCaseT of case_info * constr * fconstr * constr array * fconstr subs (* predicate and branches are closures *)
-  | FLambda of int * (Name.t * constr) list * constr * fconstr subs
+  | FFix of fixpoint * fconstr subs Univ.puniverses
+  | FCoFix of cofixpoint * fconstr subs Univ.puniverses
+  | FCaseT of case_info * constr * fconstr * constr array * fconstr subs Univ.puniverses (* predicate and branches are closures *)
+  | FLambda of int * (Name.t * constr) list * constr * fconstr subs Univ.puniverses
   | FProd of Name.t * fconstr * fconstr
-  | FLetIn of Name.t * fconstr * fconstr * constr * fconstr subs
-  | FEvar of existential * fconstr subs
+  | FLetIn of Name.t * fconstr * fconstr * constr * fconstr subs Univ.puniverses
+  | FEvar of existential * fconstr subs Univ.puniverses
   | FLIFT of int * fconstr
-  | FCLOS of constr * fconstr subs
+  | FUNIV of Univ.Instance.t * fconstr
+  | FCLOS of constr * fconstr subs Univ.puniverses
   | FLOCKED
 
 (***********************************************************************
@@ -154,9 +155,10 @@ type fterm =
 
 type stack_member =
   | Zapp of fconstr array
-  | ZcaseT of case_info * constr * constr array * fconstr subs
+  | ZcaseT of case_info * constr * constr array * fconstr subs Univ.puniverses
   | Zproj of Projection.Repr.t
   | Zfix of fconstr * stack
+  | Zuniv of Univ.Instance.t
   | Zshift of int
   | Zupdate of fconstr
 
@@ -179,7 +181,7 @@ val unfold_projection : 'a infos -> Projection.t -> stack_member option
    [create_clos_infos], inject the term to reduce with [inject]; then use
    a reduction function *)
 
-val inject : constr -> fconstr
+val inject : constr Univ.puniverses -> fconstr
 
 (** mk_atom: prevents a term from being evaluated *)
 val mk_atom : constr -> fconstr
@@ -190,7 +192,7 @@ val mk_red : fterm -> fconstr
 val fterm_of : fconstr -> fterm
 val term_of_fconstr : fconstr -> constr
 val destFLambda :
-  (fconstr subs -> constr -> fconstr) -> fconstr -> Name.t * fconstr * fconstr
+  (fconstr subs Univ.puniverses -> constr -> fconstr) -> fconstr -> Name.t * fconstr * fconstr
 
 (** Global and local constant cache *)
 type clos_infos = fconstr infos
@@ -238,15 +240,16 @@ val eq_table_key : table_key -> table_key -> bool
   i This is for lazy debug *)
 
 val lift_fconstr      : int -> fconstr -> fconstr
-val lift_fconstr_vect : int -> fconstr array -> fconstr array
+val univ_fconstr      : Univ.Instance.t -> fconstr -> fconstr
+val univ_lift_fconstr_vect : int -> Univ.Instance.t list -> fconstr array -> fconstr array
 
-val mk_clos      : fconstr subs -> constr -> fconstr
-val mk_clos_vect : fconstr subs -> constr array -> fconstr array
+val mk_clos      : fconstr subs Univ.puniverses -> constr -> fconstr
+val mk_clos_vect : fconstr subs Univ.puniverses -> constr array -> fconstr array
 
 val kni: clos_infos -> fconstr infos_tab -> fconstr -> stack -> fconstr * stack
 val knr: clos_infos -> fconstr infos_tab -> fconstr -> stack -> fconstr * stack
 val kl : clos_infos -> fconstr infos_tab -> fconstr -> constr
 
-val to_constr : lift -> fconstr -> constr
+val to_constr : lift Univ.puniverses -> fconstr -> constr
 
 (** End of cbn debug section i*)

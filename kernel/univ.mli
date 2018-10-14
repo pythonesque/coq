@@ -462,6 +462,7 @@ val make_instance_subst : Instance.t -> universe_level_subst
 (** Creates [u(0) ↦ 0; ...; u(n-1) ↦ n - 1] out of [u(0); ...; u(n - 1)] *)
 
 val make_inverse_instance_subst : Instance.t -> universe_level_subst
+(** Creates [0 ↦ u(0); ...; n - 1 ↦ u(n-1)] out of [u(0); ...; u(n - 1)] *)
 
 val abstract_universes : UContext.t -> Instance.t * AUContext.t
 val abstract_cumulativity_info : CumulativityInfo.t -> Instance.t * ACumulativityInfo.t
